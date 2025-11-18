@@ -1,83 +1,118 @@
-"""
-Gazebo contact 토픽 모니터링 전용 모듈
-
-기능:
-   - gz topic -e -t <CONTACT_TOPIC>를 subprocess로 실행
-   - stdout 라인을 읽으면서 MODEL 관련 contact 발생 시
-     asyncio.Queue 로 "collision" 이벤트를 전달
-
-* PX4 reset은 여기서 하지 않는다.
-"""
+# gz_helpers/collision_watch.py
 import asyncio
+import time
 
-# 설정
 WORLD = "rf_arena"
-MODEL = "x500_0"
+MODEL = "x500_0"  # 드론 모델 이름 (필요하면 x500 등으로 수정)
 
-# obs_a에 달린 contact sensor 토픽 (예시)
-CONTACT_TOPIC = (
-    "/world/rf_arena/model/obs_a/link/link/sensor/contact_sensor/contact"
-)
+# 실제로 존재하는 contact 센서 토픽 3개
+CONTACT_TOPICS = [
+    "/world/rf_arena/model/obs_a/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/obs_b/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/obs_c/link/link/sensor/contact_sensor/contact",
+]
 
-# 필요하면 obs_b, obs_c 토픽을 추가해서 여러 개를 동시에 모니터링하도록 확장 가능
+GRACE_SECONDS = 3.0       # 시작 후 이 시간 동안은 충돌 무시
+COOLDOWN_SECONDS = 2.0    # 한 번 이벤트 발생 후 최소 간격
 
-async def watch_contacts(event_queue: asyncio.Queue):
+
+async def _watch_one_topic(topic: str, collision_event: asyncio.Event):
     """
-    gz topic -e -t CONTACT_TOPIC을 subprocess로 실행해서
-    stdout 라인을 비동기로 읽으면서, x500_0 관련 contact 발생 시
-    event_queue에 collision 이벤트를 put
-    
-    event 예시(dict):
-    {
-        "type": "collision",
-        "model": MODEL,
-        "raw": <원본 라인 문자열>
-    }
+    단일 contact 센서 토픽을 감시하는 코루틴.
+    topic: obs_a / obs_b / obs_c 센서 토픽 중 하나
     """
-    cmd = ["gz", "topic", "-e", "-t", CONTACT_TOPIC]
-    print("[COLLISION-WATCH] Running:", " ".join(cmd))
-    print("[COLLISION-WATCH] contact 토픽을 모니터링합니다. "
-          "MODEL 관련 contact 발생 시 event_queue로 'collision' 이벤트를 보냅니다.\n")
-    
-    proc = await asyncio.create_subprocess_exec(  # subprocess.Popen()의 async 버전
-        *cmd,  # gz topic -e -t ... 외부 명령어를 새 프로세스로 실행
-        stdout=asyncio.subprocess.PIPE,          # 새로 띄운 프로세스의 표준 출력(stdout)을 파이프로 연결
-        stderr=asyncio.subprocess.STDOUT,        # 에러 출력(stderr)도 stdout과 합쳐서 한 스트림으로 모음
+    cmd = ["gz", "topic", "-e", "-t", topic]
+    print(f"[COLLISION] Watching topic: {topic}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
+
+    start_time = time.monotonic()
+
+    inside_contact = False
+    brace_depth = 0
+    hit_model = False  # 이 contact 블록 안에 MODEL(x500_0)이 들어왔는지 여부
+
+    last_emit_time = 0.0
 
     try:
         while True:
-            # IPC(PIPE)로 데이터 읽음
             line_bytes = await proc.stdout.readline()
             if not line_bytes:
-                # 프로세스 종료
-                print("[COLLISION-WATCH] gz topic process ended")
                 break
-            
+
             line = line_bytes.decode("utf-8", errors="ignore").strip()
             if not line:
                 continue
-            
-            # 전체 라인 출력 (디버깅용)
-            print("[CONTACT]", line)
 
-            # x500_0 관련 충돌이면 이벤트 전달
-            if f"{MODEL}::" in line:
-                print(f"\n[HIT] {MODEL} 이(가) 관련된 contact 메시지 감지! "
-                      "→ collision 이벤트 전송\n")
-                event = {
-                    "type": "collision",
-                    "model": MODEL,
-                    "raw": line,
-                }
-                await event_queue.put(event)
-    
+            # 디버깅 필요하면 잠깐 켜보기
+            # print(f"[RAW {topic}] {line}")
+
+            # contact 블록 시작
+            if line.startswith("contact {"):
+                inside_contact = True
+                brace_depth = 1
+                hit_model = False
+                continue
+
+            if inside_contact:
+                brace_depth += line.count("{")
+                brace_depth -= line.count("}")
+
+                # collision1:, collision2:, name: 중 하나에 모델 이름이 들어오면 hit
+                if (
+                    "collision1:" in line
+                    or "collision2:" in line
+                    or "name:" in line
+                ):
+                    if f"{MODEL}::" in line:
+                        hit_model = True
+
+                # contact 블록 끝
+                if brace_depth <= 0:
+                    inside_contact = False
+
+                    if hit_model:
+                        now = time.monotonic()
+                        elapsed = now - start_time
+
+                        if elapsed <= GRACE_SECONDS:
+                            print(f"[COLLISION] ignored (grace) on {topic}")
+                            continue
+
+                        if now - last_emit_time < COOLDOWN_SECONDS:
+                            print(f"[COLLISION] suppressed (cooldown) on {topic}")
+                            continue
+
+                        last_emit_time = now
+                        print(f"[COLLISION] HIT detected on {topic} → event.set()")
+                        collision_event.set()
+
     except asyncio.CancelledError:
-        print("[COLLISION-WATCH] Cancelled.")
-    except KeyboardInterrupt:
-        print("\n[COLLISION-WATCH] KeyboardInterrupt, stopping... ")
+        pass
     finally:
-        if proc.returncode is None:  # 아직 안 죽었으면
+        if proc.returncode is None:
             proc.terminate()
             await proc.wait()
-        print("[COLLISION-WATCH] exit.")
+        print(f"[COLLISION] watcher for {topic} exit.")
+
+
+async def watch_contacts(collision_event: asyncio.Event):
+    """
+    obs_a / obs_b / obs_c 센서 contact 토픽을 동시에 감시.
+    어느 쪽에서든 x500_0과 contact가 잡히면 collision_event.set()
+    """
+    tasks = [
+        asyncio.create_task(_watch_one_topic(topic, collision_event))
+        for topic in CONTACT_TOPICS
+    ]
+
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print("[COLLISION] all watchers cancelled.")
