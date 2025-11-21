@@ -3,23 +3,40 @@ import asyncio
 import time
 
 WORLD = "rf_arena"
-MODEL = "x500_0"  # 드론 모델 이름 (필요하면 x500 등으로 수정)
+MODEL = "x500_0"  # 드론 모델 이름 (gz world 안 모델명과 동일해야 함)
 
-# 실제로 존재하는 contact 센서 토픽 3개
+# rf_arena.sdf 에 정의된 모든 contact 센서 토픽
 CONTACT_TOPICS = [
+    # --- ground ---
+    "/world/rf_arena/model/ground_plane/link/link/sensor/ground_contact_sensor/contact",
+
+    # --- walls ---
+    "/world/rf_arena/model/wall_north/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/wall_south/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/wall_east/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/wall_west/link/link/sensor/contact_sensor/contact",
+
+    # --- original obstacles ---
     "/world/rf_arena/model/obs_a/link/link/sensor/contact_sensor/contact",
     "/world/rf_arena/model/obs_b/link/link/sensor/contact_sensor/contact",
     "/world/rf_arena/model/obs_c/link/link/sensor/contact_sensor/contact",
+
+    # --- additional obstacles ---
+    "/world/rf_arena/model/obs_d/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/obs_e/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/obs_f/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/obs_g/link/link/sensor/contact_sensor/contact",
+    "/world/rf_arena/model/obs_h/link/link/sensor/contact_sensor/contact",
 ]
 
-GRACE_SECONDS = 3.0       # 시작 후 이 시간 동안은 충돌 무시
+GRACE_SECONDS = 3.0       # 시작 후 이 시간 동안은 충돌 무시 (이륙 중 ground contact 방지)
 COOLDOWN_SECONDS = 2.0    # 한 번 이벤트 발생 후 최소 간격
 
 
 async def _watch_one_topic(topic: str, collision_event: asyncio.Event):
     """
     단일 contact 센서 토픽을 감시하는 코루틴.
-    topic: obs_a / obs_b / obs_c 센서 토픽 중 하나
+    topic: ground / walls / obs_* 센서 토픽 중 하나
     """
     cmd = ["gz", "topic", "-e", "-t", topic]
     print(f"[COLLISION] Watching topic: {topic}")
@@ -46,9 +63,6 @@ async def _watch_one_topic(topic: str, collision_event: asyncio.Event):
             line = line_bytes.decode("utf-8", errors="ignore").strip()
             if not line:
                 continue
-
-            # 디버깅 필요하면 잠깐 켜보기
-            # print(f"[RAW {topic}] {line}")
 
             # contact 블록 시작
             if line.startswith("contact {"):
@@ -101,7 +115,7 @@ async def _watch_one_topic(topic: str, collision_event: asyncio.Event):
 
 async def watch_contacts(collision_event: asyncio.Event):
     """
-    obs_a / obs_b / obs_c 센서 contact 토픽을 동시에 감시.
+    ground / walls / obs_* 센서 contact 토픽을 동시에 감시.
     어느 쪽에서든 x500_0과 contact가 잡히면 collision_event.set()
     """
     tasks = [
